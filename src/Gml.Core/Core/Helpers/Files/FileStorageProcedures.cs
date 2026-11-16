@@ -192,27 +192,38 @@ public class FileStorageProcedures : IFileStorageProcedures
 
                 var (bucketName, objectPrefix) = SplitFolder(folder);
 
-                await CreateBuсketIfNotExists(bucketName);
-
-                if (fileStream.Length > 0)
+                try
                 {
-                    var objectName = string.IsNullOrEmpty(objectPrefix)
-                        ? fileName
-                        : $"{objectPrefix}/{fileName}";
+                    await CreateBuсketIfNotExists(bucketName);
 
-                    var putObjectArgs = new PutObjectArgs()
-                        .WithContentType("application/octet-stream")
-                        .WithObjectSize(fileStream.Length)
-                        .WithStreamData(fileStream)
-                        .WithBucket(bucketName)
-                        .WithObject(objectName);
+                    if (fileStream.Length > 0)
+                    {
+                        var objectName = string.IsNullOrEmpty(objectPrefix)
+                            ? fileName
+                            : $"{objectPrefix}/{fileName}";
 
-                    // Object tagging поддерживают не все S3-совместимые хранилища (например, Cloudflare R2),
-                    // поэтому метаданные объекта (в т.ч. оригинальное имя файла) кладём в x-amz-meta-*.
-                    if (tags is not null && tags.Count > 0)
-                        putObjectArgs = putObjectArgs.WithHeaders(tags);
+                        var putObjectArgs = new PutObjectArgs()
+                            .WithContentType("application/octet-stream")
+                            .WithObjectSize(fileStream.Length)
+                            .WithStreamData(fileStream)
+                            .WithBucket(bucketName)
+                            .WithObject(objectName);
 
-                    await MinioClient.PutObjectAsync(putObjectArgs).ConfigureAwait(false);
+                        // Object tagging поддерживают не все S3-совместимые хранилища (например, Cloudflare R2),
+                        // поэтому метаданные объекта (в т.ч. оригинальное имя файла) кладём в x-amz-meta-*.
+                        if (tags is not null && tags.Count > 0)
+                            putObjectArgs = putObjectArgs.WithHeaders(tags);
+
+                        await MinioClient.PutObjectAsync(putObjectArgs).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception exception) when (exception is BucketNotFoundException or AccessDeniedException
+                                                      or ForbiddenException)
+                {
+                    throw new InvalidOperationException(
+                        $"Не удалось записать файл в S3-хранилище, бакет '{bucketName}': {exception.Message}. " +
+                        "Проверьте, что бакет создан и токену выданы права Object Read & Write на него.",
+                        exception);
                 }
 
                 break;
@@ -423,15 +434,38 @@ public class FileStorageProcedures : IFileStorageProcedures
 
     private async Task CreateBuсketIfNotExists(string bucketName)
     {
-        var beArgs = new BucketExistsArgs().WithBucket(bucketName);
-        var found = await MinioClient.BucketExistsAsync(beArgs).ConfigureAwait(false);
+        try
+        {
+            var beArgs = new BucketExistsArgs().WithBucket(bucketName);
+            var found = await MinioClient.BucketExistsAsync(beArgs).ConfigureAwait(false);
 
-        if (!found)
+            if (found)
+                return;
+        }
+        catch (Exception exception) when (exception is AccessDeniedException or ForbiddenException)
+        {
+            // Cloudflare R2 (и часть других S3-совместимых хранилищ) не разрешает HeadBucket
+            // токенам с правами Object Read & Write. Это не значит, что бакета нет — пробуем
+            // писать дальше, а если бакета действительно нет, ошибка будет понятной на PutObject.
+            Console.WriteLine($"[storage] Проверка бакета '{bucketName}' недоступна: {exception.Message}. " +
+                              "Продолжаем без проверки существования.");
+
+            return;
+        }
+
+        try
         {
             var mbArgs = new MakeBucketArgs()
                 .WithBucket(bucketName);
 
             await MinioClient.MakeBucketAsync(mbArgs).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            // С ограниченным токеном (Object Read & Write) создавать бакеты нельзя.
+            // Если бакет уже создан вручную, загрузка пройдёт; иначе увидим NoSuchBucket ниже.
+            Console.WriteLine($"[storage] Не удалось создать бакет '{bucketName}': {exception.Message}. " +
+                              "Создайте его в панели хранилища и выдайте токену права Object Read & Write.");
         }
     }
 

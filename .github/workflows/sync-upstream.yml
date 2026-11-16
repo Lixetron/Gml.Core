@@ -1,0 +1,61 @@
+name: sync-upstream
+
+# Автоматически подтягивает master из Gml-Launcher/Gml.Core.
+# Если merge прошёл без конфликтов — пушит в форк, иначе создаёт issue.
+on:
+  schedule:
+    - cron: '13 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git config user.name  "gml-sync-bot"
+          git config user.email "gml-sync-bot@users.noreply.github.com"
+          # PAT нужен, чтобы push запускал остальные workflow (события от GITHUB_TOKEN их не триггерят).
+          token="${SYNC_TOKEN:-$GITHUB_TOKEN}"
+          git remote set-url origin "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git"
+
+      - name: Merge upstream master
+        run: |
+          git remote add upstream https://github.com/Gml-Launcher/Gml.Core.git
+          git fetch upstream master
+          git merge --no-edit upstream/master
+
+      - name: Push to fork
+        run: git push origin HEAD:master
+
+      - name: Create issue on conflict
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Конфликт синхронизации с upstream ($(date -u +%F))" \
+            --body "Автомерж upstream/master не прошёл. Разреши вручную:
+
+\`\`\`
+git fetch upstream
+git merge upstream/master
+\`\`\`
+
+После разрешения конфликтов запушь master — workflow API-форка подтянет новый коммит ядра." || true

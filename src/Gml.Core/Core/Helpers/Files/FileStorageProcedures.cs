@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Threading.Tasks;
 using Gml.Models.System;
 using GmlCore.Interfaces.Enums;
@@ -10,18 +9,21 @@ using GmlCore.Interfaces.Procedures;
 using GmlCore.Interfaces.Storage;
 using GmlCore.Interfaces.System;
 using Minio;
+using Minio.DataModel;
 using Minio.DataModel.Args;
-using Minio.DataModel.Tags;
 using Minio.Exceptions;
 
 namespace Gml.Core.Helpers.Files;
 
 public class FileStorageProcedures : IFileStorageProcedures
 {
+    private static readonly string[] StorageBuckets = { "profiles", "profile-backgrounds" };
+
     private readonly IBugTrackerProcedures _bugTracker;
     private readonly ILauncherInfo _launcherInfo;
     private readonly IStorageService _storage;
     private IMinioClient? _minioClient;
+    private bool? _objectTaggingSupported;
 
     public FileStorageProcedures(ILauncherInfo launcherInfo, IStorageService storage,
         IBugTrackerProcedures bugTracker)
@@ -33,16 +35,78 @@ public class FileStorageProcedures : IFileStorageProcedures
         launcherInfo.SettingsUpdated.Subscribe(SettingsUpdated);
     }
 
-    internal IMinioClient MinioClient
+    internal IMinioClient MinioClient => _minioClient ??= CreateMinioClient();
+
+    private IMinioClient CreateMinioClient()
     {
-        get
+        var settings = _launcherInfo.StorageSettings;
+        var (endpoint, useSsl) = ParseStorageEndpoint(settings.StorageHost);
+
+        return new MinioClient()
+            .WithEndpoint(endpoint)
+            .WithCredentials(settings.StorageLogin, settings.StoragePassword)
+            .WithSSL(useSsl)
+            .Build();
+    }
+
+    /// <summary>
+    ///     Приводит значение поля "Хост хранилища" к виду, который понимает Minio-клиент.
+    ///     Схема (или порт) определяет, использовать ли HTTPS: R2, AWS S3 и большинство
+    ///     публичных S3-сервисов работают только по TLS, локальный MinIO — обычно по HTTP.
+    /// </summary>
+    internal static (string Endpoint, bool UseSsl) ParseStorageEndpoint(string? storageHost)
+    {
+        var value = (storageHost ?? string.Empty).Trim();
+        var useSsl = true;
+
+        if (value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
-            return _minioClient ??= new MinioClient()
-                .WithEndpoint(_launcherInfo.StorageSettings.StorageHost)
-                .WithCredentials(_launcherInfo.StorageSettings.StorageLogin,
-                    _launcherInfo.StorageSettings.StoragePassword)
-                .Build();
+            value = value["https://".Length..];
+            useSsl = true;
         }
+        else if (value.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value["http://".Length..];
+            useSsl = false;
+        }
+        else
+        {
+            var forcedScheme = Environment.GetEnvironmentVariable("GML_STORAGE_SCHEME");
+
+            if (!string.IsNullOrWhiteSpace(forcedScheme))
+            {
+                useSsl = !forcedScheme.Trim().Equals("http", StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                // Без схемы: порт (кроме 443) считаем локальным MinIO по http,
+                // отсутствие порта — публичным S3-совместимым сервисом по https.
+                var portSeparator = value.LastIndexOf(':');
+                useSsl = portSeparator <= 0
+                         || !int.TryParse(value[(portSeparator + 1)..], out var port)
+                         || port == 443;
+            }
+        }
+
+        // На случай, если в поле вставили полный URL с бакетом/путём — оставляем только хост.
+        var pathSeparator = value.IndexOf('/');
+
+        if (pathSeparator >= 0)
+            value = value[..pathSeparator];
+
+        return (value.TrimEnd('/'), useSsl);
+    }
+
+    private static (string Bucket, string Prefix) SplitFolder(string? folder)
+    {
+        var value = string.IsNullOrWhiteSpace(folder)
+            ? "other"
+            : folder!.Trim().Replace('\\', '/').Trim('/');
+        var separator = value.IndexOf('/');
+
+        return separator < 0
+            ? (value, string.Empty)
+            : (value[..separator], value[(separator + 1)..]);
     }
 
     public async Task<IFileInfo?> DownloadFileStream(
@@ -82,36 +146,11 @@ public class FileStorageProcedures : IFileStorageProcedures
 
                 try
                 {
-                    //ToDo: Rewrite
-                    var statObjectArgs = new GetObjectTagsArgs()
-                        .WithBucket("profiles")
-                        .WithObject(fileHash);
+                    var (downloaded, _) = await TryDownloadFromStorageAsync(StorageBuckets, fileHash, outputStream)
+                        .ConfigureAwait(false);
 
-                    var metadata = await MinioClient.GetObjectTagsAsync(statObjectArgs);
-
-                    var getObjectArgs = new GetObjectArgs()
-                        .WithBucket("profiles")
-                        .WithObject(fileHash)
-                        .WithCallbackStream(async (stream, token) => await stream.CopyToAsync(outputStream, token));
-
-                    if (metadata is not null)
-                    {
-                        // headers.Add("Content-Disposition", $"attachment; filename={metadata.Tags["file-name"]}");
-                        await MinioClient.GetObjectAsync(getObjectArgs);
-                    }
-                    else
-                    {
-                        getObjectArgs = new GetObjectArgs()
-                            .WithBucket("profile-backgrounds")
-                            .WithObject(fileHash)
-                            .WithCallbackStream(async (stream, token) =>
-                                await stream.CopyToAsync(outputStream, token));
-
-                        // headers.Add("Content-Disposition", $"attachment; filename={fileHash}");
-                        await MinioClient.GetObjectAsync(getObjectArgs);
-                    }
-
-                    localFileInfo = new LocalFileInfo();
+                    if (downloaded)
+                        localFileInfo = new LocalFileInfo();
                 }
                 catch (Exception e)
                 {
@@ -151,20 +190,27 @@ public class FileStorageProcedures : IFileStorageProcedures
 
             case StorageType.S3:
 
-                var bucketName = folder ?? "other";
+                var (bucketName, objectPrefix) = SplitFolder(folder);
 
                 await CreateBuсketIfNotExists(bucketName);
 
                 if (fileStream.Length > 0)
                 {
+                    var objectName = string.IsNullOrEmpty(objectPrefix)
+                        ? fileName
+                        : $"{objectPrefix}/{fileName}";
+
                     var putObjectArgs = new PutObjectArgs()
                         .WithContentType("application/octet-stream")
                         .WithObjectSize(fileStream.Length)
                         .WithStreamData(fileStream)
                         .WithBucket(bucketName)
-                        .WithObject(fileName);
+                        .WithObject(objectName);
 
-                    if (tags is not null && tags.Any()) putObjectArgs.WithTagging(new Tagging(tags, true));
+                    // Object tagging поддерживают не все S3-совместимые хранилища (например, Cloudflare R2),
+                    // поэтому метаданные объекта (в т.ч. оригинальное имя файла) кладём в x-amz-meta-*.
+                    if (tags is not null && tags.Count > 0)
+                        putObjectArgs = putObjectArgs.WithHeaders(tags);
 
                     await MinioClient.PutObjectAsync(putObjectArgs).ConfigureAwait(false);
                 }
@@ -210,36 +256,16 @@ public class FileStorageProcedures : IFileStorageProcedures
             case StorageType.S3:
                 try
                 {
-                    var statObjectArgs = new GetObjectTagsArgs()
-                        .WithBucket("profiles")
-                        .WithObject(fileHash);
+                    var buckets = string.IsNullOrWhiteSpace(backet)
+                        ? StorageBuckets
+                        : new[] { SplitFolder(backet).Bucket };
 
-                    var getObjectArgs = new GetObjectArgs()
-                        .WithBucket("profiles")
-                        .WithObject(fileHash)
-                        .WithCallbackStream(async (stream, token) => await stream.CopyToAsync(fileStream, token));
+                    var (downloaded, storedFileName) =
+                        await TryDownloadFromStorageAsync(buckets, fileHash, fileStream).ConfigureAwait(false);
 
-                    var metadata = await MinioClient.GetObjectTagsAsync(statObjectArgs);
-
-                    if (metadata is null)
+                    if (downloaded)
                     {
-                        statObjectArgs = new GetObjectTagsArgs()
-                            .WithBucket("profile-backgrounds")
-                            .WithObject(fileHash);
-
-                        metadata = await MinioClient.GetObjectTagsAsync(statObjectArgs);
-
-
-                        getObjectArgs = new GetObjectArgs()
-                            .WithBucket("profile-backgrounds")
-                            .WithObject(fileHash)
-                            .WithCallbackStream(async (stream, token) => await stream.CopyToAsync(fileStream, token));
-                    }
-
-                    if (metadata != null)
-                    {
-                        fileName = metadata.Tags?["file-name"] ?? fileHash;
-                        await MinioClient.GetObjectAsync(getObjectArgs);
+                        fileName = storedFileName;
                         length = fileStream.Length;
                     }
                 }
@@ -271,14 +297,18 @@ public class FileStorageProcedures : IFileStorageProcedures
                     return localFileInfo is not null;
 
                 case StorageType.S3:
+                    var (checkBucket, checkPrefix) = SplitFolder(folder);
+                    var checkObjectName = string.IsNullOrEmpty(checkPrefix)
+                        ? fileHash
+                        : $"{checkPrefix}/{fileHash}";
+
                     var fileCheck = new StatObjectArgs()
-                        .WithBucket(folder)
-                        .WithObject(fileHash);
+                        .WithBucket(checkBucket)
+                        .WithObject(checkObjectName);
 
                     var data = await MinioClient.StatObjectAsync(fileCheck);
 
                     return data.Size != 0;
-                    break;
 
                 default:
                     throw new ArgumentOutOfRangeException();
@@ -298,8 +328,86 @@ public class FileStorageProcedures : IFileStorageProcedures
         return false;
     }
 
+    private async Task<(bool Downloaded, string FileName)> TryDownloadFromStorageAsync(
+        IEnumerable<string> buckets,
+        string objectName,
+        Stream outputStream)
+    {
+        foreach (var bucket in buckets)
+        {
+            ObjectStat? stat;
+
+            try
+            {
+                stat = await MinioClient.StatObjectAsync(new StatObjectArgs()
+                    .WithBucket(bucket)
+                    .WithObject(objectName)).ConfigureAwait(false);
+            }
+            catch (ObjectNotFoundException)
+            {
+                continue;
+            }
+            catch (BucketNotFoundException)
+            {
+                continue;
+            }
+
+            if (stat is null || stat.Size <= 0)
+                continue;
+
+            await MinioClient.GetObjectAsync(new GetObjectArgs()
+                    .WithBucket(bucket)
+                    .WithObject(objectName)
+                    .WithCallbackStream((stream, token) => stream.CopyToAsync(outputStream, token)))
+                .ConfigureAwait(false);
+
+            var fileName = await GetStoredFileNameAsync(bucket, objectName, stat).ConfigureAwait(false);
+
+            return (true, string.IsNullOrWhiteSpace(fileName) ? objectName : fileName!);
+        }
+
+        return (false, string.Empty);
+    }
+
+    private async Task<string?> GetStoredFileNameAsync(string bucket, string objectName, ObjectStat stat)
+    {
+        if (stat.MetaData is not null
+            && stat.MetaData.TryGetValue("file-name", out var fileName)
+            && !string.IsNullOrWhiteSpace(fileName))
+        {
+            return fileName;
+        }
+
+        // Совместимость со старыми объектами, у которых имя файла хранилось в тегах (MinIO, AWS S3).
+        // Cloudflare R2 теги объектов не поддерживает — запоминаем результат, чтобы не дёргать API зря.
+        if (_objectTaggingSupported == false)
+            return null;
+
+        try
+        {
+            var tagging = await MinioClient.GetObjectTagsAsync(new GetObjectTagsArgs()
+                .WithBucket(bucket)
+                .WithObject(objectName)).ConfigureAwait(false);
+
+            _objectTaggingSupported = true;
+
+            return tagging?.Tags is not null && tagging.Tags.TryGetValue("file-name", out var tagFileName)
+                ? tagFileName
+                : null;
+        }
+        catch (Exception exception)
+        {
+            _objectTaggingSupported = false;
+            Console.WriteLine(exception);
+
+            return null;
+        }
+    }
+
     private void SettingsUpdated(IStorageSettings settings)
     {
+        _objectTaggingSupported = null;
+
         switch (_launcherInfo.StorageSettings.StorageType)
         {
             case StorageType.LocalStorage:

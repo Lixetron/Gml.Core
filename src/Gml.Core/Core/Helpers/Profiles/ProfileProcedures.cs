@@ -1016,7 +1016,18 @@ public partial class ProfileProcedures : IProfileProcedures
 
     private async void RestoreProfile(GameProfile profile)
     {
-        await UpdateProfilesService(profile);
+        // async void: любое необработанное исключение здесь убивает процесс (и контейнер
+        // уходит в рестарт-луп). Ошибку хранилища нужно только залогировать.
+        try
+        {
+            await UpdateProfilesService(profile);
+        }
+        catch (Exception exception)
+        {
+            profile.State = ProfileState.Error;
+            Console.WriteLine(exception);
+            _gmlManager.BugTracker.CaptureException(exception);
+        }
     }
 
     private string NormalizePath(string directory, string fileDirectory)

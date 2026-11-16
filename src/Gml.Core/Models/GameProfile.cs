@@ -75,12 +75,32 @@ public class GameProfile : BaseProfile
 
     private async void CreateServerListener(IProfileServer server)
     {
-        await server.UpdateStatusAsync();
+        // async void: исключение отсюда роняет весь процесс, поэтому глушим и логируем.
+        try
+        {
+            await server.UpdateStatusAsync();
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine(exception);
+        }
 
         var timer = Observable.Interval(TimeSpan.FromMinutes(2))
-            .Subscribe(_ => server.UpdateStatusAsync());
+            .Subscribe(_ => SafeUpdateServerStatus(server));
 
         _serverTimers.TryAdd(server, timer);
+    }
+
+    private static async void SafeUpdateServerStatus(IProfileServer server)
+    {
+        try
+        {
+            await server.UpdateStatusAsync();
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine(exception);
+        }
     }
 
     public override void AddServer(IProfileServer server)

@@ -30,7 +30,6 @@ jobs:
         run: |
           git config user.name  "gml-sync-bot"
           git config user.email "gml-sync-bot@users.noreply.github.com"
-          # PAT нужен, чтобы push запускал остальные workflow (события от GITHUB_TOKEN их не триггерят).
           token="${SYNC_TOKEN:-$GITHUB_TOKEN}"
           git remote set-url origin "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git"
 
@@ -48,14 +47,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          gh issue create \
-            --repo "${{ github.repository }}" \
+          body=$(printf 'Автомерж upstream/master не прошёл. Разреши вручную:\n\n    git fetch upstream\n    git merge upstream/master\n\nПосле разрешения конфликтов запушь master — workflow API-форка подтянет новый коммит ядра.\n')
+          gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "Конфликт синхронизации с upstream ($(date -u +%F))" \
-            --body "Автомерж upstream/master не прошёл. Разреши вручную:
-
-\`\`\`
-git fetch upstream
-git merge upstream/master
-\`\`\`
-
-После разрешения конфликтов запушь master — workflow API-форка подтянет новый коммит ядра." || true
+            --body "$body" || true
